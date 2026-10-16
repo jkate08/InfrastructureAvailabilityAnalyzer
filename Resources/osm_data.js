@@ -1,0 +1,2 @@
+window.ROAD_NODES_COUNT = 14513;
+window.ROAD_EDGES_COUNT = 34768;

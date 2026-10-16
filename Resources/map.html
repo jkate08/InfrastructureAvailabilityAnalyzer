@@ -1,0 +1,536 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="utf-8" />
+    <title>Isochrone Analyzer</title>
+
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="referrer" content="strict-origin-when-cross-origin" />
+
+    <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+
+    <script src="osm_data.js"></script>
+
+    <style>
+        html, body {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            font-family: "Segoe UI", Arial, sans-serif;
+            background: #f4f5f7;
+        }
+
+        body {
+            overflow: hidden;
+        }
+
+        #topbar {
+            height: 72px;
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            padding: 0 16px;
+            box-sizing: border-box;
+            background: #f6f7f9;
+            border-bottom: 1px solid #d8dde6;
+        }
+
+        #controls {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            flex-shrink: 0;
+        }
+
+        .mode-button {
+            width: 130px;
+            height: 42px;
+            border: none;
+            border-radius: 10px;
+            background: #2d7ef7;
+            color: white;
+            cursor: pointer;
+            font-size: 16px;
+            font-weight: 600;
+            box-shadow: 0 2px 6px rgba(45, 126, 247, 0.18);
+            transition: background 0.2s ease, transform 0.15s ease, box-shadow 0.2s ease;
+        }
+
+            .mode-button:hover {
+                background: #1f6fe6;
+                box-shadow: 0 3px 8px rgba(45, 126, 247, 0.24);
+            }
+
+            .mode-button:active {
+                transform: translateY(1px);
+            }
+
+        #statusText {
+            font-size: 13px;
+            color: #5a6472;
+            line-height: 1.35;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            flex: 1 1 auto;
+            min-width: 180px;
+        }
+
+        .legend {
+            display: flex;
+            gap: 14px;
+            margin-left: 10px;
+            font-size: 13px;
+            align-items: center;
+            color: #2f3a48;
+            flex-shrink: 0;
+        }
+
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            white-space: nowrap;
+        }
+
+        .legend-dot {
+            width: 13px;
+            height: 13px;
+            border-radius: 50%;
+            border: 1px solid #222;
+            display: inline-block;
+        }
+
+        .green-dot {
+            background: green;
+        }
+
+        .yellow-dot {
+            background: yellow;
+        }
+
+        .red-dot {
+            background: red;
+        }
+
+        #map {
+            width: 100%;
+            height: calc(100% - 72px);
+        }
+
+    </style>
+</head>
+
+<body>
+    <div id="topbar">
+        <div id="controls">
+            <button class="mode-button" onclick="runMode('walk')">Пешком</button>
+            <button class="mode-button" onclick="runMode('car')">На машине</button>
+        </div>
+
+        <span id="statusText">Загружается OSM...</span>
+
+        <div class="legend">
+            <div class="legend-item">
+                <span class="legend-dot green-dot"></span>
+                до 5 мин
+            </div>
+            <div class="legend-item">
+                <span class="legend-dot yellow-dot"></span>
+                до 10 мин
+            </div>
+            <div class="legend-item">
+                <span class="legend-dot red-dot"></span>
+                до 15 мин
+            </div>
+        </div>
+    </div>
+
+    <div id="map"></div>
+
+    <script>
+
+        // Создание карты. Центр — город Муром.
+const map = L.map('map', {
+    preferCanvas: true,
+    attributionControl: true
+}).setView([55.5792, 42.0524], 14);
+
+    // Подключение тайлов OpenStreetMap.
+L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19,
+    attribution:
+        '&copy; <a href="https://www.openstreetmap.org/copyright">' +
+        'OpenStreetMap</a> contributors'
+}).addTo(map);
+
+       
+        map.createPane('zonesPane');
+        map.getPane('zonesPane').style.zIndex = 405;
+        map.getPane('zonesPane').style.pointerEvents = 'none';
+
+        map.createPane('graphPane');
+        map.getPane('graphPane').style.zIndex = 410;
+        map.getPane('graphPane').style.pointerEvents = 'none';
+
+        map.createPane('pointsPane');
+        map.getPane('pointsPane').style.zIndex = 430;
+        map.getPane('pointsPane').style.pointerEvents = 'none';
+
+        const statusText = document.getElementById('statusText');
+
+        // маркер точки, которую поставил пользователь
+        let startMarker = null;
+
+        // маркер ближайшего узла дорожного графа
+        let nearestMarker = null;
+
+        // текущий режим движения: пешком или на машине
+        let currentMode = 'walk';
+
+        const pointRenderer = L.canvas({
+        padding: 0.5,
+        pane: 'pointsPane'
+        });
+
+        const zonesLayer = L.layerGroup().addTo(map);
+        const segmentsLayer = L.layerGroup().addTo(map);
+        const pointsLayer = L.layerGroup().addTo(map);
+
+        // вывод информации о загруженном графе
+        function loadOSMInfo() {
+        const roadNodesCount = window.ROAD_NODES_COUNT || 0;
+        const roadEdgesCount = window.ROAD_EDGES_COUNT || 0;
+
+        statusText.textContent =
+        'OSM загружен: точек графа ' + roadNodesCount +
+        ', рёбер ' + roadEdgesCount +
+        '. Выберите точку на карте.';
+        }
+
+        loadOSMInfo();
+
+        // обработка клика по карте
+        // пользователь выбирает стартовую точку
+        map.on('click', function (e) {
+        const lat = e.latlng.lat;
+        const lng = e.latlng.lng;
+
+        // при выборе новой точки очищаем старые зоны, точки и линии
+        zonesLayer.clearLayers();
+        pointsLayer.clearLayers();
+        segmentsLayer.clearLayers();
+
+        if (startMarker) {
+        map.removeLayer(startMarker);
+        }
+
+        if (nearestMarker) {
+        map.removeLayer(nearestMarker);
+        }
+
+        // ставим маркер в точку клика
+        startMarker = L.marker([lat, lng]).addTo(map);
+
+        statusText.textContent =
+        'Выбрана точка: lat = ' +
+        lat.toFixed(4) +
+        ', lng = ' +
+        lng.toFixed(4) +
+        '. Ищу ближайшую точку графа...';
+
+        // отправляем координаты клика в C++ через WebView2
+        if (window.chrome && window.chrome.webview) {
+        window.chrome.webview.postMessage('CLICK|' + lat + '|' + lng);
+        }
+        });
+
+        // запуск построения зон
+        function runMode(mode) {
+        currentMode = mode;
+
+        if (!window.chrome || !window.chrome.webview) {
+        statusText.textContent = 'Ошибка: WebView2 недоступен.';
+        return;
+        }
+
+        if (!nearestMarker) {
+        statusText.textContent = 'Сначала поставьте точку на карту.';
+        return;
+        }
+
+        if (mode === 'walk') {
+        statusText.textContent = 'Строятся зоны 5 / 10 / 15 минут пешком...';
+        } else {
+        statusText.textContent = 'Строятся зоны 5 / 10 / 15 минут на машине...';
+        }
+
+        // отправляем команду запуска расчёта в C++
+        window.chrome.webview.postMessage('RUN|' + mode);
+        }
+
+        
+        function cross(o, a, b) {
+        return (a.lng - o.lng) * (b.lat - o.lat) -
+        (a.lat - o.lat) * (b.lng - o.lng);
+        }
+
+        
+        function buildConvexHull(points) {
+        if (!points || points.length < 3) {
+        return [];
+        }
+
+        // сортируем точки по долготе, а если долгота равна — по широте
+        const sorted = points
+        .map(function (p) {
+        return {
+        lat: Number(p.lat),
+        lng: Number(p.lng)
+        };
+        })
+        .sort(function (a, b) {
+        if (a.lng === b.lng) {
+        return a.lat - b.lat;
+        }
+
+        return a.lng - b.lng;
+        });
+
+        const lower = [];
+
+        // строим нижнюю часть оболочки
+        for (let i = 0; i < sorted.length; i++) {
+        while (lower.length >= 2 &&
+        cross(lower[lower.length - 2], lower[lower.length - 1], sorted[i]) <= 0) {
+        lower.pop();
+        }
+
+        lower.push(sorted[i]);
+        }
+
+        const upper = [];
+
+        // строим верхнюю часть оболочки
+        for (let i = sorted.length - 1; i >= 0; i--) {
+        while (upper.length >= 2 &&
+        cross(upper[upper.length - 2], upper[upper.length - 1], sorted[i]) <= 0) {
+        upper.pop();
+        }
+
+        upper.push(sorted[i]);
+        }
+
+        // удаляем повторяющиеся крайние точки
+        upper.pop();
+        lower.pop();
+
+        return lower.concat(upper);
+        }
+
+        // рисование одного полигона зоны
+        function drawZone(points, color, opacity) {
+        if (!points || points.length < 3) {
+        return 0;
+        }
+
+        const hull = buildConvexHull(points);
+
+        if (!hull || hull.length < 3) {
+        return 0;
+        }
+
+        const latLngs = hull.map(function (p) {
+        return [p.lat, p.lng];
+        });
+
+        L.polygon(latLngs, {
+        pane: 'zonesPane',
+        color: color,
+        weight: 1,
+        opacity: 0.45,
+        fillColor: color,
+        fillOpacity: opacity
+        }).addTo(zonesLayer);
+
+        return 1;
+        }
+
+        
+        function drawZones(points) {
+        zonesLayer.clearLayers();
+
+        if (!points || points.length === 0) {
+        return 0;
+        }
+
+        const greenPoints = [];
+        const yellowPoints = [];
+        const redPoints = [];
+
+        points.forEach(function (p) {
+        const t = Number(p.time);
+
+        if (t <= 900) {
+        redPoints.push(p);
+        }
+
+        if (t <= 600) {
+        yellowPoints.push(p);
+        }
+
+        if (t <= 300) {
+        greenPoints.push(p);
+        }
+        });
+
+        let zonesCount = 0;
+
+        zonesCount += drawZone(redPoints, 'red', 0.16);
+        zonesCount += drawZone(yellowPoints, 'yellow', 0.22);
+        zonesCount += drawZone(greenPoints, 'green', 0.28);
+
+        return zonesCount;
+        }
+
+        // рисование серых линий между достижимыми узлами
+        function drawSegments(segments) {
+        segmentsLayer.clearLayers();
+
+        if (!segments || segments.length === 0) {
+        return 0;
+        }
+
+        segments.forEach(function (s) {
+        L.polyline(
+        [
+        [s.lat1, s.lng1],
+        [s.lat2, s.lng2]
+        ],
+        {
+        pane: 'graphPane',
+        color: '#4d4d4d',
+        weight: 2,
+        opacity: 0.55,
+        lineCap: 'round',
+        lineJoin: 'round'
+        }
+        ).addTo(segmentsLayer);
+        });
+
+        return segments.length;
+        }
+
+        // рисование цветных точек достижимости
+        function drawReachablePoints(points) {
+        pointsLayer.clearLayers();
+
+        if (!points || points.length === 0) {
+        statusText.textContent = 'Достижимые точки не найдены.';
+        return 0;
+        }
+
+        points.forEach(function (p) {
+        L.circleMarker([p.lat, p.lng], {
+        pane: 'pointsPane',
+        renderer: pointRenderer,
+        radius: 4,
+        color: 'black',
+        weight: 1,
+        fillColor: p.color,
+        fillOpacity: 0.95
+        }).addTo(pointsLayer);
+        });
+
+        return points.length;
+        }
+
+        // получение сообщений из C++
+        if (window.chrome && window.chrome.webview) {
+        window.chrome.webview.addEventListener('message', function (event) {
+        try {
+        const data =
+        typeof event.data === 'string'
+        ? JSON.parse(event.data)
+        : event.data;
+
+        // C++ сообщает, что данные OSM обработаны
+        if (data.type === 'data_ready') {
+        const roadNodes = data.roadNodes || window.ROAD_NODES_COUNT || 0;
+        const roadEdges = data.roadEdges || window.ROAD_EDGES_COUNT || 0;
+
+        statusText.textContent =
+        'OSM загружен и обработан в C++: точек графа ' +
+        roadNodes +
+        ', рёбер ' +
+        roadEdges +
+        '. Выберите точку на карте.';
+        }
+
+        // C++ нашёл ближайший узел дорожного графа
+        else if (data.type === 'point_saved') {
+        if (nearestMarker) {
+        map.removeLayer(nearestMarker);
+        }
+
+        nearestMarker = L.circleMarker(
+        [data.nearestLat, data.nearestLng],
+        {
+        radius: 8,
+        color: 'black',
+        fillColor: '#3fa7ff',
+        fillOpacity: 1,
+        weight: 2
+        }
+        ).addTo(map);
+
+        statusText.textContent =
+        'Ближайшая точка графа найдена. Теперь нажмите "Пешком" или "На машине".';
+        }
+
+        // C++ вернул результат расчёта зон.
+        else if (data.type === 'points_result') {
+        const zonesCount = drawZones(data.points);
+        const segmentsCount = drawSegments(data.segments);
+        const pointsCount = drawReachablePoints(data.points);
+
+        const green = data.greenCount || 0;
+        const yellow = data.yellowCount || 0;
+        const red = data.redCount || 0;
+
+        let modeText = 'пешком';
+
+        if (currentMode === 'car') {
+        modeText = 'на машине';
+        }
+
+        statusText.textContent =
+        'Построены зоны ' + modeText +
+        ': до 5 мин — ' + green +
+        ', до 10 мин — ' + yellow +
+        ', до 15 мин — ' + red +
+        '. Точек: ' + pointsCount +
+        ', линий: ' + segmentsCount +
+        ', полигонов: ' + zonesCount + '.';
+        }
+
+        // C++ сообщил об ошибке.
+        else if (data.type === 'error') {
+        statusText.textContent = data.text;
+        }
+
+        } catch (e) {
+        console.error('Ошибка обработки сообщения из C++:', e);
+        console.log('event.data:', event.data);
+        statusText.textContent = 'Ошибка обработки сообщения из C++.';
+        }
+        });
+        } else {
+        statusText.textContent =
+        'Карта открыта не в WebView2. Связь с C++ недоступна.';
+        }
+    </script>
+</body>
+</html>
